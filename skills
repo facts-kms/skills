@@ -1,0 +1,485 @@
+#!/usr/bin/env bash
+
+# Program variables
+SKILLS_VARS_PROG=$(basename $0)
+SKILLS_VARS_SVER="0.1.0"
+SKILLS_VARS_HELP=0
+SKILLS_VARS_TARGET_KEYWORDS=(agents claude codex copilot)
+
+# Resolve the real file this script lives in, even when invoked through a
+# symlink or found on $PATH, so a default source path can be found relative
+# to the CLI itself rather than the caller's working directory.
+SKILLS_VARS_SELF=$0
+case "$SKILLS_VARS_SELF" in
+  */*) ;;
+  *) SKILLS_VARS_SELF=$(command -v "$SKILLS_VARS_SELF") ;;
+esac
+while [ -h "$SKILLS_VARS_SELF" ]; do
+  SKILLS_VARS_SELF_DIR=$(cd -P "$(dirname "$SKILLS_VARS_SELF")" && pwd)
+  SKILLS_VARS_SELF=$(readlink "$SKILLS_VARS_SELF")
+  case "$SKILLS_VARS_SELF" in
+    /*) ;;
+    *) SKILLS_VARS_SELF="$SKILLS_VARS_SELF_DIR/$SKILLS_VARS_SELF" ;;
+  esac
+done
+SKILLS_VARS_SELF_DIR=$(cd -P "$(dirname "$SKILLS_VARS_SELF")" && pwd)
+
+# Path variables
+SKILLS_PATH_ROOT=${SKILLS_PATH_ROOT:=$HOME}
+SKILLS_PATH_SOURCE=${SKILLS_PATH_SOURCE:=$SKILLS_VARS_SELF_DIR/.agents/skills}
+SKILLS_PATH_TARGET_AGENTS=${SKILLS_PATH_TARGET_AGENTS:=$SKILLS_PATH_ROOT/.agents/skills}
+SKILLS_PATH_TARGET_CLAUDE=${SKILLS_PATH_TARGET_CLAUDE:=$SKILLS_PATH_ROOT/.claude/skills}
+SKILLS_PATH_TARGET_CODEX=${SKILLS_PATH_TARGET_CODEX:=$SKILLS_PATH_ROOT/.codex/skills}
+SKILLS_PATH_TARGET_COPILOT=${SKILLS_PATH_TARGET_COPILOT:=$SKILLS_PATH_ROOT/.copilot/skills}
+SKILLS_PATH_BASE=${SKILLS_PATH_BASE:=$HOME/.skills}
+SKILLS_PATH_LOGS=${SKILLS_PATH_LOGS:=$SKILLS_PATH_BASE/logs}
+
+# Utility functions
+
+function skills_get_input_for_name() {
+  local value=$1
+  if [ -z "$value" ]; then
+    echo "Error: Skill name is required" >&2
+    return 1
+  fi
+  if [[ ! "$value" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]; then
+    echo "Error: Invalid skill name format: $value" >&2
+    return 1
+  fi
+  echo "$value"
+  return 0
+}
+
+function skills_get_input_for_target() {
+  local value=$1
+  local keyword
+  if [ -z "$value" ]; then
+    echo "Error: Target is required" >&2
+    return 1
+  fi
+  if [ "$value" == "all" ]; then
+    echo "$value"
+    return 0
+  fi
+  for keyword in "${SKILLS_VARS_TARGET_KEYWORDS[@]}"; do
+    if [ "$value" == "$keyword" ]; then
+      echo "$value"
+      return 0
+    fi
+  done
+  echo "Error: Invalid target: $value (expected one of: all ${SKILLS_VARS_TARGET_KEYWORDS[*]})" >&2
+  return 1
+}
+
+function skills_get_input_for_mode() {
+  local value=$1
+  if [ "$value" != "force" ]; then
+    echo "Error: Invalid mode: $value (expected: force)" >&2
+    return 1
+  fi
+  echo "$value"
+  return 0
+}
+
+function skills_get_source_path() {
+  if [ ! -d "$SKILLS_PATH_SOURCE" ]; then
+    echo "Error: source skills directory not found: $SKILLS_PATH_SOURCE" >&2
+    return 1
+  fi
+  (cd "$SKILLS_PATH_SOURCE" && pwd -P)
+  return 0
+}
+
+function skills_get_target_path() {
+  local keyword=$1
+  case "$keyword" in
+    agents) echo "$SKILLS_PATH_TARGET_AGENTS" ;;
+    claude) echo "$SKILLS_PATH_TARGET_CLAUDE" ;;
+    codex) echo "$SKILLS_PATH_TARGET_CODEX" ;;
+    copilot) echo "$SKILLS_PATH_TARGET_COPILOT" ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+function skills_get_skill_names() {
+  local source=$1
+  local dir
+  for dir in "$source"/*/; do
+    [ -d "$dir" ] || continue
+    basename "$dir"
+  done
+}
+
+function skills_get_skill_description() {
+  local skill_dir=$1
+  local skill_md="$skill_dir/SKILL.md"
+  [ -f "$skill_md" ] || return 0
+  awk '
+    /^description:/ { inside=1; sub(/^description: */, ""); if ($0 != "" && $0 != ">-") print; next }
+    inside && /^[a-zA-Z0-9_]+:/ { inside=0 }
+    inside { sub(/^[ \t]+/, ""); print }
+  ' "$skill_md"
+  return 0
+}
+
+function skills_get_link_status() {
+  local name=$1
+  local target=$2
+  local src="$SKILLS_VARS_SOURCE/$name"
+  local dest="$target/$name"
+  local current
+  if [ -L "$dest" ]; then
+    current=$(readlink "$dest")
+    if [ "$current" == "$src" ]; then
+      echo "linked"
+    else
+      echo "stale"
+    fi
+  elif [ -e "$dest" ]; then
+    echo "blocked"
+  else
+    echo "missing"
+  fi
+  return 0
+}
+
+function skills_get_link_preview() {
+  local source=$1
+  local keyword target name status
+  for keyword in "${SKILLS_VARS_TARGET_KEYWORDS[@]}"; do
+    target=$(skills_get_target_path "$keyword")
+    if [ ! -d "$target" ]; then
+      echo "$keyword: not installed ($target)"
+      continue
+    fi
+    echo "$keyword: $target"
+    while IFS= read -r name; do
+      status=$(skills_get_link_status "$name" "$target")
+      case "$status" in
+        linked) echo "  already linked   $name" ;;
+        missing) echo "  would link       $name" ;;
+        stale) echo "  stale link       $name (run: $SKILLS_VARS_PROG link $keyword force)" ;;
+        blocked) echo "  blocked          $name (a real file or directory exists)" ;;
+      esac
+    done < <(skills_get_skill_names "$source" | sort)
+  done
+  return 0
+}
+
+function skills_get_unlink_preview() {
+  local source=$1
+  local keyword target name status
+  for keyword in "${SKILLS_VARS_TARGET_KEYWORDS[@]}"; do
+    target=$(skills_get_target_path "$keyword")
+    if [ ! -d "$target" ]; then
+      echo "$keyword: not installed ($target)"
+      continue
+    fi
+    echo "$keyword: $target"
+    while IFS= read -r name; do
+      status=$(skills_get_link_status "$name" "$target")
+      [ "$status" == "linked" ] && echo "  would unlink     $name"
+    done < <(skills_get_skill_names "$source" | sort)
+  done
+  return 0
+}
+
+function skills_set_links() {
+  local source=$1
+  local target_kw=$2
+  local force=$3
+  local keywords=()
+  local keyword target name src dest status
+
+  if [ "$target_kw" == "all" ]; then
+    keywords=("${SKILLS_VARS_TARGET_KEYWORDS[@]}")
+  else
+    keywords=("$target_kw")
+  fi
+
+  for keyword in "${keywords[@]}"; do
+    target=$(skills_get_target_path "$keyword")
+    if [ ! -d "$target" ]; then
+      if [ "$target_kw" == "all" ]; then
+        echo "$keyword: not installed, skipping ($target)"
+        continue
+      elif [ "$force" -eq 1 ]; then
+        mkdir -p "$target" 2>/dev/null
+        chmod 0700 "$target" 2>/dev/null
+        if [ ! -d "$target" ]; then
+          skills_set_error_message "link: could not create target directory: $target"
+        fi
+        echo "$keyword: $target (created)"
+      else
+        skills_set_error_message "link: target directory does not exist: $target"
+      fi
+    else
+      echo "$keyword: $target"
+    fi
+    while IFS= read -r name; do
+      src="$source/$name"
+      dest="$target/$name"
+      status=$(skills_get_link_status "$name" "$target")
+      case "$status" in
+        linked)
+          echo "  already linked   $name"
+          ;;
+        stale)
+          if [ "$force" -eq 1 ]; then
+            rm "$dest"
+            ln -s "$src" "$dest"
+            echo "  relinked         $name"
+          else
+            echo "  skipped          $name (linked elsewhere; use: $SKILLS_VARS_PROG link $keyword force)"
+          fi
+          ;;
+        blocked)
+          echo "  skipped          $name (a real file or directory exists)"
+          ;;
+        missing)
+          ln -s "$src" "$dest"
+          echo "  linked           $name"
+          ;;
+      esac
+    done < <(skills_get_skill_names "$source" | sort)
+  done
+  return 0
+}
+
+function skills_set_unlinks() {
+  local source=$1
+  local target_kw=$2
+  local keywords=()
+  local keyword target name dest status
+
+  if [ "$target_kw" == "all" ]; then
+    keywords=("${SKILLS_VARS_TARGET_KEYWORDS[@]}")
+  else
+    keywords=("$target_kw")
+  fi
+
+  for keyword in "${keywords[@]}"; do
+    target=$(skills_get_target_path "$keyword")
+    if [ ! -d "$target" ]; then
+      if [ "$target_kw" == "all" ]; then
+        echo "$keyword: not installed, skipping ($target)"
+        continue
+      else
+        skills_set_error_message "unlink: target directory does not exist: $target"
+      fi
+    fi
+    echo "$keyword: $target"
+    while IFS= read -r name; do
+      dest="$target/$name"
+      status=$(skills_get_link_status "$name" "$target")
+      if [ "$status" == "linked" ]; then
+        rm "$dest"
+        echo "  unlinked         $name"
+      fi
+    done < <(skills_get_skill_names "$source" | sort)
+  done
+  return 0
+}
+
+# Error handler
+
+function skills_set_error_message() {
+  local message=$1
+  local code=${2:-1}
+  local timestamp=$(date +"%Y-%m-%d %H:%M:%S")
+  echo "Error: $message" >&2
+  echo "[$timestamp] ERROR: $message" >> "$SKILLS_PATH_LOGS/errors.log"
+  exit $code
+}
+
+# Command functions
+
+function skills_cmd_list() {
+  local source name status keyword target
+  source=$(skills_get_source_path) || skills_set_error_message "list: source not found"
+  SKILLS_VARS_SOURCE="$source"
+
+  if [ $# -eq 0 ]; then
+    skills_get_skill_names "$source" | sort
+    exit 0
+  elif [ $# -eq 1 ]; then
+    name=$(skills_get_input_for_name "$1") || skills_set_error_message "list: invalid skill name"
+    if [ ! -d "$source/$name" ]; then
+      skills_set_error_message "list: unknown skill: $name"
+    fi
+    echo "$name"
+    echo
+    skills_get_skill_description "$source/$name"
+    echo
+    echo "Linked into:"
+    for keyword in "${SKILLS_VARS_TARGET_KEYWORDS[@]}"; do
+      target=$(skills_get_target_path "$keyword")
+      if [ ! -d "$target" ]; then
+        printf "  %-10s not installed\n" "$keyword"
+        continue
+      fi
+      status=$(skills_get_link_status "$name" "$target")
+      printf "  %-10s %s\n" "$keyword" "$status"
+    done
+    exit 0
+  else
+    skills_set_error_message "list: too many arguments"
+  fi
+}
+
+function skills_cmd_link() {
+  local source target_kw mode
+  source=$(skills_get_source_path) || skills_set_error_message "link: source not found"
+  SKILLS_VARS_SOURCE="$source"
+
+  if [ $# -eq 0 ]; then
+    skills_get_link_preview "$source"
+    exit 0
+  elif [ $# -eq 1 ]; then
+    target_kw=$(skills_get_input_for_target "$1") || skills_set_error_message "link: invalid target"
+    skills_set_links "$source" "$target_kw" 0
+    exit 0
+  elif [ $# -eq 2 ]; then
+    target_kw=$(skills_get_input_for_target "$1") || skills_set_error_message "link: invalid target"
+    mode=$(skills_get_input_for_mode "$2") || skills_set_error_message "link: invalid mode"
+    skills_set_links "$source" "$target_kw" 1
+    exit 0
+  else
+    skills_set_error_message "link: too many arguments"
+  fi
+}
+
+function skills_cmd_unlink() {
+  local source target_kw
+  source=$(skills_get_source_path) || skills_set_error_message "unlink: source not found"
+  SKILLS_VARS_SOURCE="$source"
+
+  if [ $# -eq 0 ]; then
+    skills_get_unlink_preview "$source"
+    exit 0
+  elif [ $# -eq 1 ]; then
+    target_kw=$(skills_get_input_for_target "$1") || skills_set_error_message "unlink: invalid target"
+    skills_set_unlinks "$source" "$target_kw"
+    exit 0
+  else
+    skills_set_error_message "unlink: too many arguments"
+  fi
+}
+
+# Help function
+
+function skills_cmd_get_help() {
+  cat << EOF
+Usage: $SKILLS_VARS_PROG [COMMAND] [ARGS...]
+
+Symlink this project's skills into agent skills directories.
+See '$SKILLS_VARS_PROG help' for a list of commands.
+EOF
+  [[ $SKILLS_VARS_HELP -gt 0 ]] && cat << EOF
+Commands:
+  list                 List the skills available to link.
+                       Example:
+                         $SKILLS_VARS_PROG list
+
+  list NAME            Show one skill's description and its link status
+                       in every known target.
+                       Example:
+                         $SKILLS_VARS_PROG list fact-workflow
+
+  link                 Preview what linking would do in every target
+                       that exists, without changing anything.
+                       Example:
+                         $SKILLS_VARS_PROG link
+
+  link TARGET          Symlink every skill into TARGET. TARGET is one
+                       of agents, claude, codex, copilot, or all.
+                       Examples:
+                         $SKILLS_VARS_PROG link claude
+                         $SKILLS_VARS_PROG link all
+
+  link TARGET force    Same as above, but also relinks a symlink that
+                       points somewhere else, and creates TARGET if it
+                       doesn't exist yet (unless TARGET is all, which
+                       still only touches directories that already
+                       exist). Never touches a real file or directory
+                       that already occupies a skill's name.
+                       Example:
+                         $SKILLS_VARS_PROG link claude force
+
+  unlink               Preview which links would be removed from every
+                       target that exists, without changing anything.
+                       Example:
+                         $SKILLS_VARS_PROG unlink
+
+  unlink TARGET        Remove this project's symlinks from TARGET.
+                       Only ever removes a symlink pointing into this
+                       project's skills; never a real file or
+                       directory. TARGET is one of agents, claude,
+                       codex, copilot, or all.
+                       Examples:
+                         $SKILLS_VARS_PROG unlink codex
+                         $SKILLS_VARS_PROG unlink all
+
+  help                 Show this help.
+                       Example:
+                         $SKILLS_VARS_PROG help
+
+Targets (only used when the directory already exists):
+  agents   $SKILLS_PATH_TARGET_AGENTS
+  claude   $SKILLS_PATH_TARGET_CLAUDE
+  codex    $SKILLS_PATH_TARGET_CODEX
+  copilot  $SKILLS_PATH_TARGET_COPILOT
+
+  Each target defaults to \$SKILLS_PATH_ROOT/.NAME/skills, and
+  \$SKILLS_PATH_ROOT defaults to \$HOME. Override \$SKILLS_PATH_ROOT to
+  localize an install under a different root (e.g. a project directory
+  instead of your home directory), or override one target directly, e.g.
+  \$SKILLS_PATH_TARGET_CLAUDE.
+
+Source directory (override with \$SKILLS_PATH_SOURCE):
+  $SKILLS_PATH_SOURCE
+
+  Defaults to .agents/skills next to this script (not the current
+  directory), so $SKILLS_VARS_PROG finds its own skills the same way
+  whether it's run in place, invoked from elsewhere by path, or found
+  on \$PATH through a symlink.
+
+This is "$SKILLS_VARS_PROG" version $SKILLS_VARS_SVER. Copyright $(date +%Y). All rights reserved.
+EOF
+  exit 1
+}
+
+# Startup logic
+
+mkdir -p "$SKILLS_PATH_LOGS" 2>/dev/null
+chmod 0700 "$SKILLS_PATH_BASE" 2>/dev/null
+chmod 0700 "$SKILLS_PATH_LOGS" 2>/dev/null
+
+# Dispatch logic
+
+if [ $# -eq 0 ]; then
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG help"
+  skills_cmd_get_help
+elif [ "$1" == "list" ]; then
+  shift
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG list"
+  skills_cmd_list "$@"
+elif [ "$1" == "link" ]; then
+  shift
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG link"
+  skills_cmd_link "$@"
+elif [ "$1" == "unlink" ]; then
+  shift
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG unlink"
+  skills_cmd_unlink "$@"
+elif [ "$1" == "help" ]; then
+  shift
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG help"
+  SKILLS_VARS_HELP=1
+  skills_cmd_get_help
+else
+  SKILLS_VARS_CLI_CMD="$SKILLS_VARS_PROG help"
+  SKILLS_VARS_HELP=1
+  skills_cmd_get_help
+fi
